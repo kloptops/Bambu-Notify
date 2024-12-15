@@ -1,0 +1,6 @@
+{
+    "print_start": "**{{CURRENT_STATUS}} {{PRINT_NAME}}:**",
+    "print_fail": "**{{CURRENT_STATUS}} {{PRINT_NAME}}:**\nLayer: {{CURRENT_LAYER}} / {{TOTAL_LAYERS}} *({{PERCENTAGE}} %)*\nREMAINING: {{REMAINING}}",
+    "print_finish": "**{{CURRENT_STATUS}} {{PRINT_NAME}}:**\nLayer: {{CURRENT_LAYER}} / {{TOTAL_LAYERS}} *({{PERCENTAGE}} %)*\nREMAINING: {{REMAINING}}",
+    "print_status": "**{{CURRENT_STATUS}} {{PRINT_NAME}}:**\nLayer: {{CURRENT_LAYER}} / {{TOTAL_LAYERS}} *({{PERCENTAGE}} %)*\nREMAINING: {{REMAINING}}"
+}

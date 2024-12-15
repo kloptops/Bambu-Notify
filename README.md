@@ -48,3 +48,19 @@ REPORT_EVERY_5_PERC = "N"
 REPORT_EVERY_10_PERC = "N"
 
 ```
+
+
+# Things it cant do:
+
+- Info is kinda sparse atm, will add more variables as i figure them out.
+- Start notification cannot have picture.
+- If it disconnects it just bugs out, i will add more error handling as we go... threads fucking suck arse.
+
+
+# TODO:
+
+- [ ] Add more variables
+- [ ] Add better error handling
+- [ ] Add better state handling for resuming from crashes.
+- [ ] Create some better default templates.
+- [ ] Create a script that will launch the program when it detects the printer is online and will restart it.

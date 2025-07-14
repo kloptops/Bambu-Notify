@@ -1,0 +1,53 @@
+# Configuration for Bambu Notify
+
+# Bambu Printer Connection Details
+bambu_printer:
+  hostname: "192.168.1.100"       # IP address of your printer
+  access_code: "12345678"          # Access code from the printer's screen
+  serial: "00M00A000000000"        # Serial number of your printer
+
+# Camera Settings
+camera:
+  enabled: true                    # Set to false to disable camera frames in notifications
+
+# Print Log Settings
+# Saves a detailed log of the printer's status during a print for analysis.
+print_log:
+  enabled: false                   # Set to true to enable logging prints.
+  log_directory: "print_logs"      # Directory to save the log files.
+  log_interval_seconds: 15         # How often to write a status update to the log file.
+
+
+# Notification Settings
+notifications:
+  # A list of Discord/etc. webhook URLs to send notifications to.
+  webhooks:
+    - "https://discord.com/api/webhooks/your_webhook_id/your_webhook_token"
+    # - "https://discord.com/api/webhooks/another_webhook"
+
+  # --- Progress Calculation ---
+  # How to calculate the print completion percentage.
+  # 'time' (default): Uses the printer's time-based estimate (mc_percent).
+  # 'layer': Calculates percentage based on current_layer / total_layers. More accurate for physical progress.
+  percentage_mode: "time"
+
+  # The Jinja2 template file to use for formatting messages.
+  template_file: "messages.jinja"
+
+  # --- Event Triggers (true/false) ---
+  report_start: true               # Notify when a print starts.
+  report_finish: true              # Notify when a print finishes successfully.
+  report_failure: true             # Notify when a print fails.
+  report_pause: true               # Notify when a print is paused.
+  report_resume: true              # Notify when a print is resumed.
+  
+  report_first_layer: true         # Send a progress report after the first layer.
+  report_second_layer: false       # Send a progress report after the second layer.
+
+  # Send a progress report when these percentages are reached.
+  # It will only send ONE notification for each milestone.
+  report_percentages:
+    - 25
+    - 50
+    - 75
+    # - 90

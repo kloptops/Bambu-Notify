@@ -41,6 +41,12 @@ REPORT_25_PERC = "N"
 REPORT_50_PERC = "Y"
 REPORT_75_PERC = "N"
 
+# Report differently for prints over 120 minutes (2 hours)
+REPORT_LONG_THRESHOLD = "120"
+REPORT_LONG_25_PERC = "Y"
+REPORT_LONG_50_PERC = "Y"
+REPORT_LONG_75_PERC = "Y"
+
 # Report every 5%
 REPORT_EVERY_5_PERC = "N"
 

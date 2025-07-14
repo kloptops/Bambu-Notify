@@ -1,0 +1,48 @@
+{#
+  Jinja2 Template for Bambu Notify
+  
+  Available variables:
+  - print: The full PrinterStatus object. Access attributes like `print.subtask_name`,
+           `print.mc_percent`, `print.layer_num`, `print.stage_name` etc.
+  - event: The name of the event that triggered this notification (e.g., 'print_start').
+  
+  Available functions:
+  - format_time(minutes): Formats an integer of minutes into a human-readable string.
+#}
+
+{% block print_start %}
+✅ **Print Started: {{ print.subtask_name or 'Unknown File' }}**
+Estimated Time: {{ format_time(print.mc_remaining_time) }}
+{% endblock %}
+
+
+{% block print_finish %}
+🎉 **Print Finished: {{ print.subtask_name or 'Unknown File' }}**
+The print completed successfully!
+{% endblock %}
+
+
+{% block print_failure %}
+❌ **Print Failed: {{ print.subtask_name or 'Unknown File' }}**
+The printer has reported a failure. Please check the printer.
+{% endblock %}
+
+
+{% block print_pause %}
+⏸️ **Print Paused: {{ print.subtask_name or 'Unknown File' }}**
+Reason: **{{ print.stage_name }}**
+Progress: {{ print.mc_percent }}%
+{% endblock %}
+
+
+{% block print_resume %}
+▶️ **Print Resumed: {{ print.subtask_name or 'Unknown File' }}**
+Progress: {{ print.mc_percent }}%
+{% endblock %}
+
+
+{% block progress_report %}
+ℹ️ **Printing: {{ print.subtask_name or 'Unknown File' }}**
+Progress: {{ print.mc_percent }}% (Layer {{ print.layer_num }} / {{ print.total_layer_num }})
+Time Remaining: {{ format_time(print.mc_remaining_time) }}
+{% endblock %}

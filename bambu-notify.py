@@ -1,539 +1,463 @@
-#!/bin/env python3
+#!/usr/bin/env python3
 
-# SPDX-License-Identifier: MIT
-
-import json
-import os
-import pathlib
-import pprint
+import argparse
+import logging
 import queue
+import signal
+import sys
 import threading
 import time
+import json
 
+from datetime import datetime
 from pathlib import Path
 from dataclasses import asdict
 
+import jinja2
 import requests
+import yaml
 
-from dotenv import load_dotenv
 from bambu_connect import BambuClient, PrinterStatus
 
+from bambu_defs import STAGE_DESCRIPTIONS
 
-load_dotenv()
+# --- Setup Logging ---
+log = logging.getLogger("bambu-notify")
 
-# Replace these with your actual details
-hostname      = os.getenv('HOSTNAME')
-access_code   = os.getenv('ACCESS_CODE')
-serial        = os.getenv('SERIAL')
-webhook_urls  = [os.getenv('WEBHOOK')]
-messages_file = os.getenv('MESSAGES_FILE')
-
-i = 2
-while True:
-    additional_url = os.getenv(f'WEBHOOK_{i}')
-    if additional_url is None:
-        break
-
-    webhook_urls.append(additional_url)
-    i += 1
-
-report_first_layer  = os.getenv('REPORT_FIRST_LAYER', 'Y')
-report_second_layer = os.getenv('REPORT_SECOND_LAYER', 'Y')
-
-report_25_perc = os.getenv('REPORT_25_PERC', 'N')
-report_50_perc = os.getenv('REPORT_50_PERC', 'Y')
-report_75_perc = os.getenv('REPORT_75_PERC', 'N')
-
-report_every_5_perc  = os.getenv('REPORT_EVERY_5_PERC', 'N')
-report_every_10_perc = os.getenv('REPORT_EVERY_10_PERC', 'N')
-
-report_start   = os.getenv('REPORT_START',   'Y')
-report_finish  = os.getenv('REPORT_FINISH',  'Y')
-report_failure = os.getenv('REPORT_FAILURE', 'Y')
-
-# Running variables.
-FIRST_STATE_EVENT = False
-
-LAST_FRAME = b""
-LAST_STATE = None
-
-REPORTED_PERCENTAGES  = {}
-REPORTED_FIRST_LAYER  = False
-REPORTED_SECOND_LAYER = False
-REPORTED_25_PERCENT = False
-REPORTED_50_PERCENT = False
-REPORTED_75_PERCENT = False
-
-THREAD_LOCK   = threading.RLock()
-
-CAMERA_ACTIVE = False
-
-CAMERA_TIMER  = None
-TASK_QUEUE    = queue.Queue()
-
-bambu_client  = None
-
-### Classes
-
-class ReusableTimer:
-    def __init__(self, interval, task, recurring=False):
-        self.interval = interval
-        self.task = task
-        self.timer = None
-        self.running = False
-        self.recurring = recurring
-
-    def start(self):
-        if not self.running:
-            self.running = True
-            self._schedule_next()
-
-    def _schedule_next(self):
-        if self.running:
-            self.timer = threading.Timer(self.interval, self._run_task)
-            self.timer.start()
-
-    def _run_task(self):
-        self.task()
-        if self.recurring:
-            self._schedule_next()  # Schedule the next execution
-
-    def restart(self):
-        # cancel task if running then start it again, otherwise just start it.
-        if self.running:
-            self.stop()
-        self.start()
-
-    def stop(self):
-        if self.timer:
-            self.timer.cancel()
-        self.running = False
-
-
-### Functions
-
-def do_start_print():
-    global REPORTED_FIRST_LAYER, REPORTED_SECOND_LAYER, REPORTED_PERCENTAGES
-    global REPORTED_25_PERCENT, REPORTED_50_PERCENT, REPORTED_75_PERCENT
-
-    REPORTED_PERCENTAGES.clear()
-    REPORTED_FIRST_LAYER  = False
-    REPORTED_SECOND_LAYER = False
-    REPORTED_25_PERCENT = False
-    REPORTED_50_PERCENT = False
-    REPORTED_75_PERCENT = False
-
-
-def do_report_event(printer_status):
-    """
-    Figure out the most appropriate event to send a message about.
-
-    The logic is that if we want first/second layer notification, then 25% progress should not fire before that event.
-
-    TODO: base percentage on the number of layers done instead of the printer reporting.
-    """
-
-    global LAST_STATE, REPORTED_SECOND_LAYER, REPORTED_FIRST_LAYER, REPORTED_PERCENTAGES, FIRST_STATE_EVENT
-    global REPORTED_25_PERCENT, REPORTED_50_PERCENT, REPORTED_75_PERCENT
-
-    state_text = {
-        "PREPARE": "Starting",
-        "FAILED": "Failed",
-        "FINISH": "Finished",
-        "RUNNING": "Printing",
-        "IDLE": "Idle",
-        }
-
-    printer_status.setdefault('current_status', state_text.get(printer_status['gcode_state']
-, 'Printing'))
-
-    printer_status['layer_num'] = get_value(printer_status, 'layer_num', 0)
-    printer_status['total_layer_num'] = get_value(printer_status, 'total_layer_num', 1)
-
-    if printer_status['total_layer_num'] == 0:
-        printer_status['total_layer_num'] = 1
-
-    # Fix the percentage based on layer number.
-    printer_status['mc_percent'] = int(printer_status['layer_num'] / printer_status['total_layer_num'] * 100)
-
-    # ALL OTHER STATE LOGIC
-    if printer_status['gcode_state'] != LAST_STATE:
-        if printer_status['gcode_state'] == 'PREPARE':
-
-            LAST_STATE = printer_status['gcode_state']
-
-            do_start_print()
-
-            if report_start == 'Y':
-                return 'print_start'
-
-            return None
-
-        if printer_status['gcode_state'] == 'FAILED':
-            LAST_STATE = printer_status['gcode_state']
-
-            if report_failure == 'Y':
-                return 'print_fail'
-
-            return None
-
-        if printer_status['gcode_state'] == 'FINISH':
-            LAST_STATE = printer_status['gcode_state']
-
-            if report_finish == 'Y':
-                return 'print_finish'
-
-            return None
-
-        if printer_status['gcode_state'] != 'RUNNING':
-            LAST_STATE = printer_status['gcode_state']
-            print(f"Unknown state {LAST_STATE}")
-            return None
-
-        LAST_STATE = printer_status['gcode_state']
-
-    if printer_status['gcode_state'] != 'RUNNING':
-        return None
-
-    # RUNNING STATE LOGIC
-    if report_first_layer == 'Y' and REPORTED_FIRST_LAYER == False:
-        if printer_status['layer_num'] > 1:
-            REPORTED_FIRST_LAYER = True
-            return 'print_status'
-
-        return None
-
-    if report_second_layer == 'Y' and REPORTED_SECOND_LAYER == False:
-        if printer_status['layer_num'] > 2:
-            REPORTED_SECOND_LAYER = True
-            return 'print_status'
-
-        return None
-
-    # Highest priority.
-    percentage_5_perc = (printer_status['mc_percent'] // 5 * 5) == printer_status['mc_percent']
-    if report_every_5_perc == 'Y':
-        if REPORTED_PERCENTAGES.get(printer_status['mc_percent'], False) == False:
-            REPORTED_PERCENTAGES[printer_status['mc_percent']] = True
-            return 'print_status'
-
-        return None
-
-    # Next highest priority.
-    percentage_10_perc = (printer_status['mc_percent'] // 10 * 10) == printer_status['mc_percent']
-    if report_every_10_perc == 'Y':
-        if REPORTED_PERCENTAGES.get(printer_status['mc_percent'], False) == False:
-            REPORTED_PERCENTAGES[printer_status['mc_percent']] = True
-            return 'print_status'
-
-        return None
-
-    # Fall back to standard 25/50/75% reporting.
-    if report_25_perc == "Y" and REPORTED_25_PERCENT == False:
-        if printer_status['mc_percent'] >= 25:
-            REPORTED_25_PERCENT = True
-            return 'print_status'
-
-        return None
-
-    if report_50_perc == "Y" and REPORTED_50_PERCENT == False:
-        if printer_status['mc_percent'] >= 50:
-            REPORTED_50_PERCENT = True
-            return 'print_status'
-
-        return None
-
-    if report_75_perc == "Y" and REPORTED_75_PERCENT == False:
-        if printer_status['mc_percent'] >= 75:
-            REPORTED_75_PERCENT = True
-            return 'print_status'
-
-        return None
-
-    return None
-
-
-def oc_join(strings):
-    """
-    Oxford comma join
-    """
-    if len(strings) == 0:
-        return ""
-
-    elif len(strings) == 1:
-        return strings[0]
-
-    elif len(strings) == 2:
-        return f"{strings[0]} and {strings[1]}"
-
-    else:
-        oxford_comma_list = ", ".join(strings[:-1]) + ", and " + strings[-1]
-        return oxford_comma_list
-
-
-def format_time(minutes):
+# --- Helper Functions & Classes ---
+def format_time(minutes: int) -> str:
+    """Formats minutes into a human-readable string like '1 day, 2 hours, and 5 minutes'."""
     if minutes == 0:
-        return "0 minutes"
+        return "less than a minute"
 
-    days = minutes // (24 * 60)
-    hours = (minutes % (24 * 60)) // 60
-    mins = minutes % 60
-
+    days, rem = divmod(minutes, 1440)
+    hours, mins = divmod(rem, 60)
     parts = []
+
     if days > 0:
         parts.append(f"{days} day{'s' if days > 1 else ''}")
     if hours > 0:
         parts.append(f"{hours} hour{'s' if hours > 1 else ''}")
     if mins > 0:
         parts.append(f"{mins} minute{'s' if mins > 1 else ''}")
+    
+    if len(parts) == 0:
+        return ""
 
-    return oc_join(parts)
+    if len(parts) == 1:
+        return parts[0]
 
-
-def format_file(data):
-    file_name = data.get('gcode_file', None)
-    if file_name == '' or file_name is None:
-        file_name = data.get('subtask_name', None)
-
-        if file_name == '' or file_name is None:
-            return 'Unknown File'
-
-    if file_name.rsplit('.', 1)[-1] in ('stl', '3mf', 'step'):
-        file_name = file_name.rsplit('.', 1)[0]
-
-    return file_name
+    return ", ".join(parts[:-1]) + f" and {parts[-1]}"
 
 
-def get_value(data, value, default):
-    result = data.get(value, default)
+class StateManager:
+    """Encapsulates all logic for managing printer state and deciding when to notify."""
 
-    if result is None:
-        return default
+    def __init__(self, config):
+        self.config = config.get('notifications', {})
+        self.is_primed = False
+        # The gcode_state is now initialized here and NOT in the reset method.
+        self.last_gcode_state = "IDLE" 
+        self._reset_print_state()
 
-    return result
+    def _reset_print_state(self):
+        """Resets all flags related to a single print job."""
+        log.info("Resetting print job tracking.")
+        # DO NOT reset last_gcode_state here. That tracks the machine, not the job.
+        self.reported_percentages = set()
+        self.reported_first_layer = False
+        self.reported_second_layer = False
+
+    def prime_state(self, status: PrinterStatus):
+        """Sets the initial state from the first status message to prevent old notifications."""
+        log.info("Priming state from initial printer status...")
+        # We don't need a full reset here, just set the initial state
+        self.last_gcode_state = status.gcode_state
+
+        if status.gcode_state == 'RUNNING':
+            log.debug(f"Printer is running. Priming progress: {status.mc_percent}% complete, layer {status.layer_num}.")
+            if status.layer_num > 1:
+                self.reported_first_layer = True
+            if status.layer_num > 2:
+                self.reported_second_layer = True
+
+            # Mark all past percentages as "reported"
+            for p in range(status.mc_percent + 1):
+                self.reported_percentages.add(p)
+
+        self.is_primed = True
+        log.info("State has been primed.")
+
+    def process_status(self, status: PrinterStatus) -> str | None:
+        """Processes a new status update and returns an event name if a notification is needed."""
+        if not self.is_primed:
+            self.prime_state(status)
+            return None # Don't notify on the first priming message
+
+        event = None
+        # --- Check for major state changes ---
+        if status.gcode_state != self.last_gcode_state:
+            log.info(f"State changed from '{self.last_gcode_state}' to '{status.gcode_state}'")
+            
+            # --- FIX: More specific condition for a new print start ---
+            if status.gcode_state == 'RUNNING' and self.last_gcode_state != 'PAUSE':
+                self._reset_print_state()
+                if self.config.get('report_start', True): event = 'print_start'
+            elif status.gcode_state == 'FINISH':
+                if self.config.get('report_finish', True): event = 'print_finish'
+            elif status.gcode_state == 'FAILED':
+                if self.config.get('report_failure', True): event = 'print_failure'
+            elif status.gcode_state == 'PAUSE':
+                if self.config.get('report_pause', True): event = 'print_pause'
+            elif self.last_gcode_state == 'PAUSE' and status.gcode_state == 'RUNNING':
+                if self.config.get('report_resume', True): event = 'print_resume'
+            
+            # Update the state AFTER processing the change
+            self.last_gcode_state = status.gcode_state
+            if event: return event
+
+        # --- If not printing, do nothing else ---
+        if status.gcode_state != 'RUNNING':
+            return None
+
+        # --- Check for progress-based notifications ---
+        if self.config.get('report_first_layer') and not self.reported_first_layer and status.layer_num > 1:
+            self.reported_first_layer = True
+            return 'progress_report'
+
+        if self.config.get('report_second_layer') and not self.reported_second_layer and status.layer_num > 2:
+            self.reported_second_layer = True
+            return 'progress_report'
+
+        # Percentage-based reporting
+        for p in self.config.get('report_percentages', []):
+            if p not in self.reported_percentages and status.mc_percent >= p:
+                # Mark this and all previous percentages as reported to avoid spam
+                for i in range(p + 1):
+                    self.reported_percentages.add(i)
+                return 'progress_report'
+        
+        return None
 
 
-def format_message(message_text, printer_status):
-    return (message_text
-        .replace("{{CURRENT_STATUS}}", get_value(printer_status, 'current_status', 'Printing'))
-        .replace("{{CURRENT_LAYER}}", str(get_value(printer_status, 'layer_num', 0)))
-        .replace("{{TOTAL_LAYERS}}", str(get_value(printer_status, 'total_layer_num', 1)))
-        .replace("{{PERCENTAGE}}", str(get_value(printer_status, 'mc_percent', 1)))
-        .replace("{{REMAINING}}", format_time(get_value(printer_status, 'mc_remaining_time', 0)))
-        .replace("{{PRINT_NAME}}", format_file(printer_status))
+class CameraManager:
+    """Manages the camera stream and frame capture."""
+    def __init__(self, bambu_client: BambuClient):
+        self._client = bambu_client
+        self._lock = threading.Lock()
+        self._last_frame = b""
+        self._is_active = False
+
+    def _save_frame_callback(self, frame: bytes):
+        with self._lock:
+            self._last_frame = frame
+
+    def start(self):
+        with self._lock:
+            if self._is_active:
+                return
+            log.info("Starting camera stream...")
+            self._client.start_camera_stream(self._save_frame_callback)
+            self._is_active = True
+
+    def stop(self):
+        with self._lock:
+            if not self._is_active:
+                return
+            log.info("Stopping camera stream...")
+            self._client.stop_camera_stream()
+            self._last_frame = b""
+            self._is_active = False
+
+    def get_frame(self, wait_seconds=5) -> bytes:
+        """Tries to get a fresh frame from the camera, waiting if necessary."""
+
+        # First, ensure the camera is active. Call start() OUTSIDE of the lock.
+        # The start() method handles its own locking, so this is safe.
+        if not self._is_active:
+            self.start()
+
+        # Now, wait for a frame to be delivered by the callback.
+        for _ in range(wait_seconds):
+            # We only need to lock when we're actually reading the shared _last_frame variable.
+            with self._lock:
+                if self._last_frame:
+                    return self._last_frame
+            time.sleep(1)        
+
+        log.warning("Could not retrieve a camera frame in time.")
+        return b""
+
+
+class Notifier:
+    """Renders templates and sends notifications to webhooks."""
+    def __init__(self, config):
+        # First, get the 'notifications' section of the config.
+        notifications_config = config.get('notifications', {})
+        
+        # Now, get the specific settings from within that section.
+        self.webhooks = notifications_config.get('webhooks', [])
+        template_path = Path(notifications_config.get('template_file', 'messages.jinja'))
+        
+        if not template_path.exists():
+            log.error(f"Template file not found at: {template_path}")
+            sys.exit(1)
+
+        self.jinja_env = jinja2.Environment(
+            loader=jinja2.FileSystemLoader(template_path.parent),
+            autoescape=True
         )
+        self.jinja_env.globals['format_time'] = format_time
+        self.template_name = template_path.name
 
-
-def get_message(event_type):
-    global messages_file
-
-    default_message = "**{{CURRENT_STATUS}} {{PRINT_NAME}}:**\nLayer: {{CURRENT_LAYER}} / {{TOTAL_LAYERS}} *({{PERCENTAGE}} %)*\nREMAINING: {{REMAINING}}"
-    if messages_file is None:
-        return default_message
-
-    try:
-        with open(messages_file, 'r') as fh:
-            data = json.load(fh)
-
-        return data.get(event_type, data.get(event_type, default_message))
-
-    except Exception as err:
-        print(f"Error: problem parsing {messages_file}: {err}")
-        return default_message
-
-
-def save_latest_frame(img):
-    global LAST_FRAME, THREAD_LOCK
-    """Save the latest frame to a variable."""
-    with THREAD_LOCK:
-        LAST_FRAME = img
-
-
-def get_latest_frame():
-    global LAST_FRAME, THREAD_LOCK
-    """Fetch the latest frame from the variable."""
-    with THREAD_LOCK:
-        return LAST_FRAME
-
-
-def start_camera():
-    global THREAD_LOCK, CAMERA_ACTIVE, CAMERA_TIMER, bambu_client
-
-    with THREAD_LOCK:
-        if CAMERA_ACTIVE:
+    def send(self, event: str, status: PrinterStatus, frame: bytes):
+        log.info(f"Sending notification for event: '{event}'")
+        
+        # If there are no webhooks configured, don't even bother rendering.
+        if not self.webhooks:
+            log.warning("No webhooks configured. Skipping notification.")
             return
 
-        if CAMERA_TIMER.running:
-            print("Notice: REENABLE CAMERA STREAM")
+        context = {'print': status, 'event': event}
+        try:
+            template = self.jinja_env.get_template(self.template_name)
 
-            CAMERA_TIMER.stop()
-            CAMERA_ACTIVE = True
+            if event in template.blocks:
+                content = "".join(template.blocks[event](template.new_context(context)))
+            else:
+                content = template.render(context)
+
+        except Exception as e:
+            log.error(f"Failed to render template for event '{event}': {e}")
             return
 
-        print("Notice: ENABLE CAMERA STREAM")
-        bambu_client.start_camera_stream(save_latest_frame, stop_camera_for_reals)
-        CAMERA_ACTIVE = True
+        for i, url in enumerate(self.webhooks):
+            try:
+                files = {'camera.jpg': (f"camera_{event}.jpg", frame, 'image/jpeg')} if frame else None
+                
+                if files:
+                    payload = {'payload_json': json.dumps({'content': content})}
+                    response = requests.post(url, files=files, data=payload, timeout=10)
+                else:
+                    response = requests.post(url, json={'content': content}, timeout=10)
 
-
-def stop_camera():
-    global THREAD_LOCK, CAMERA_ACTIVE, CAMERA_TIMER
-
-    with THREAD_LOCK:
-        if not CAMERA_ACTIVE:
-            return
-
-        print("Notice: DISABLING CAMERA STREAM")
-        CAMERA_TIMER.start()
-        CAMERA_ACTIVE = False
-
-
-def stop_camera_for_reals():
-    global bambu_client, LAST_FRAME, THREAD_LOCK, CAMERA_ACTIVE
-
-    print("Notice: DISABLE CAMERA STREAM")
-    bambu_client.stop_camera_stream()
-
-    with THREAD_LOCK:
-        CAMERA_ACTIVE = False
-        LAST_FRAME = b""
-
-
-def custom_callback(msg):
-    global FIRST_STATE_EVENT, TASK_QUEUE
-
-    printer_status = asdict(msg)
-
-    if not FIRST_STATE_EVENT:
-        event_type = do_report_event(printer_status)
-
-        print(f"- {event_type}")
-
-        if event_type == 'printer_status':
-            TASK_QUEUE.put((event_type, printer_status))
-
-        while (skipped_events := do_report_event(printer_status)):
-            print(f"   skipping {skipped_events} event")
-            pass
-
-        FIRST_STATE_EVENT = True
-        return
-
-    event_type = do_report_event(printer_status)
-
-    if not event_type:
-        return
-
-    print(f"- {event_type}")
-
-    while (skipped_events := do_report_event(printer_status)):
-        print(f"   skipping {skipped_events} event")
-        pass
-
-    # Add to event queue
-    TASK_QUEUE.put((event_type, printer_status))
-
-
-def main_queue_runner():
-    global TASK_QUEUE, THREAD_LOCK, LAST_FRAME, webhook_urls
-
-    while True:
-        task = TASK_QUEUE.get()
-        if task is None:
-            break
-
-        print(f"{task}")
-
-        event_type, printer_status = task
-
-        print(f"{event_type}")
-
-        if event_type in ('print_status'):
-            start_camera()
-
-        if event_type in ('print_fail', 'print_finish'):
-            stop_camera()
-
-        camera_image = b""
-
-        for i in range(10):
-            # Wait 10 seconds maximum for an image from the camera.
-            camera_image = get_latest_frame()
-            if LAST_FRAME != b"":
-                break
+                response.raise_for_status()
+                log.info(f"  Webhook {i+1} sent successfully (Status: {response.status_code}).")
+            except requests.RequestException as e:
+                log.error(f"  Webhook {i+1} failed: {e}")
 
             time.sleep(1)
 
-        else:
-            print("Error: Unable to get camera_image.")
+class PrintLogger:
+    """Handles logging of print jobs to a file for later analysis."""
 
-        # DO DISPLAY STUFF HERE.
-        print(f"EVENT {event_type}")
+    KEYS_TO_OMIT = [
+        'ams', 'vt_tray', 'lights_report', 'ipcam', 'upgrade_state', 'online', 
+        'force_upgrade'
+        ]
 
-        message_text = format_message(get_message(event_type), printer_status)
+    def __init__(self, config):
+        self.config = config.get('print_log', {})
+        if not self.config.get('enabled', False):
+            return
 
-        for i, webhook_url in enumerate(webhook_urls):
-            if camera_image is None or camera_image == b"":
-                response = requests.post(
-                    webhook_url,
-                    data={"content": message_text})
+        self.log_dir = Path(self.config.get('log_directory', 'print_logs'))
+        self.log_interval = self.config.get('log_interval_seconds', 15)
+        
+        self.is_logging = False
+        self.log_file = None
+        self.last_log_time = 0
 
-            else:
-                response = requests.post(
-                    webhook_url,
-                    files={"camera.jpg": camera_image},
-                    data={"content": message_text})
+        # Create the log directory if it doesn't exist
+        try:
+            self.log_dir.mkdir(parents=True, exist_ok=True)
+            log.info(f"Print logs will be saved to: {self.log_dir.resolve()}")
+        except OSError as e:
+            log.error(f"Failed to create log directory {self.log_dir}: {e}")
+            self.config['enabled'] = False # Disable logging if dir fails
 
-            if response.status_code in (204, 200):  # No Content
-                print(f"  WEBHOOK {i} SUCCESS")
-            else:
-                print(f"  WEBHOOK {i} FAILURE: {response.status_code}: {response.text}")
+    def _generate_filename(self, status: PrinterStatus) -> str:
+        """Generates a log filename based on print metadata."""
+        now = datetime.now()
+        date_str = now.strftime("%Y-%m-%d")
 
-            time.sleep(2)
+        # Use metadata from the status, with fallbacks for safety
+        project_id = status.project_id or "p0"
+        task_id = status.task_id or "t0"
+        subtask_id = status.subtask_id or "s0"
 
-def on_watch_client_connect():
-    print("Notice: WatchClient connected, Waiting for connection...")
-    time.sleep(1)  # Waits for 1 second
+        return f"print_{date_str}_{project_id}_{task_id}_{subtask_id}.log"
 
-    print("Notice: Executing dump_info.")
-    bambu_client.dump_info()
+    def _filter_status(self, raw_status: dict) -> dict:
+        """Removes large, unnecessary keys from the status dictionary."""
+        filtered_data = raw_status.copy()
+        for key in self.KEYS_TO_OMIT:
+            filtered_data.pop(key, None) # Use pop with a default to avoid KeyErrors
+        return filtered_data
 
-### Stuff
+    def start_logging(self, status: PrinterStatus):
+        """Opens a new log file at the start of a print."""
+        if self.is_logging:
+            return
+            
+        filename = self._generate_filename(status)
+        filepath = self.log_dir / filename
+        
+        try:
+            self.log_file = open(filepath, 'w')
+            self.is_logging = True
+            self.last_log_time = 0 # Reset timer to log the first status immediately
+            log.info(f"Starting new print log: {filename}")
+        except IOError as e:
+            log.error(f"Could not open log file {filepath}: {e}")
+
+    def stop_logging(self):
+        """Closes the current log file."""
+        if not self.is_logging or not self.log_file:
+            return
+
+        log.info(f"Closing print log: {self.log_file.name}")
+        self.log_file.close()
+        self.log_file = None
+        self.is_logging = False
+
+    def process_status(self, status: PrinterStatus):
+        """The main entry point to be called for every status update."""
+        if not self.config.get('enabled', False):
+            return
+
+        # --- Detect Print Start/Stop ---
+        is_printing = status.gcode_state == 'RUNNING'
+        is_finished = status.gcode_state in ('FINISH', 'FAILED')
+
+        if is_printing and not self.is_logging:
+            self.start_logging(status)
+        elif is_finished and self.is_logging:
+            # Log the final status before stopping
+            self._write_log(status) 
+            self.stop_logging()
+
+        # --- Timed Logging during a print ---
+        if self.is_logging:
+            now = time.time()
+            if now - self.last_log_time >= self.log_interval:
+                self._write_log(status)
+                self.last_log_time = now
+
+    def _write_log(self, status: PrinterStatus):
+        """Filters and writes a single status entry to the log file."""
+        if not self.is_logging or not self.log_file:
+            return
+
+        filtered_data = self._filter_status(asdict(status))
+        log_entry = json.dumps(filtered_data)
+        self.log_file.write(log_entry + "\n")
+
 
 def main():
-    global bambu_client, CAMERA_ACTIVE, CAMERA_TIMER, TASK_QUEUE
+    parser = argparse.ArgumentParser(description="Bambu Lab printer monitoring and notification tool.")
+    parser.add_argument("-c", "--config", default="config.yml", help="Path to the configuration file.")
+    parser.add_argument("-v", "--verbose", action="store_true", help="Enable detailed debug logging.")
+    args = parser.parse_args()
 
-    bambu_client = BambuClient(hostname, access_code, serial)
-    activity_thread = None
+    # --- Configure Logging ---
+    log_level = logging.DEBUG if args.verbose else logging.INFO
+    logging.basicConfig(level=log_level, format='%(asctime)s - %(levelname)s - %(message)s')
 
-    # Stop camera after 30 or so seconds.
-    CAMERA_TIMER = ReusableTimer(30, stop_camera_for_reals)
+    # --- Load Configuration ---
+    try:
+        with open(args.config, 'r') as f:
+            config = yaml.safe_load(f)
+    except (FileNotFoundError, yaml.YAMLError) as e:
+        log.error(f"Failed to load configuration file '{args.config}': {e}")
+        sys.exit(1)
+
+    # --- Initialize Components ---
+    bambu_cfg = config.get('bambu_printer', {})
+    client = BambuClient(bambu_cfg['hostname'], bambu_cfg['access_code'], bambu_cfg['serial'])
+    state_manager = StateManager(config)
+    notifier = Notifier(config)
+    camera_manager = CameraManager(client)
+    print_logger = PrintLogger(config)
+    task_queue = queue.Queue()
+    shutdown_event = threading.Event()
+
+    # --- Define Callbacks and Workers ---
+    def printer_status_callback(status: PrinterStatus):
+        percentage_mode = config.get('notifications', {}).get('percentage_mode', 'time')
+        
+        if percentage_mode == 'layer':
+            # Defend against division by zero if total_layer_num is not yet known (e.g., at print start)
+            if status.total_layer_num > 0:
+                # Calculate layer-based percentage
+                new_percent = int((status.layer_num / status.total_layer_num) * 100)
+                # Overwrite the time-based percentage on the status object
+                # log.debug(f"Overriding time-based percentage ({status.mc_percent}%) with layer-based ({new_percent}%).")
+                status.mc_percent = min(new_percent, 100) # Cap at 100%
+            else:
+                # If we can't calculate, it's very early in the print. Use 0%.
+                status.mc_percent = 0
+
+        stage_code = status.mc_print_sub_stage
+        status.stage_name = STAGE_DESCRIPTIONS.get(stage_code, f"Unknown Stage ({stage_code})")
+
+        print_logger.process_status(status)
+
+        event = state_manager.process_status(status)
+        if event:
+            log.debug(f"Queueing notification task for event: {event}")
+            task_queue.put((event, status))
+
+    def notification_worker():
+        while not shutdown_event.is_set():
+            try:
+                event, status = task_queue.get(timeout=1)
+                
+                frame = b""
+                if config.get('camera', {}).get('enabled', True):
+                    frame = camera_manager.get_frame()
+                
+                notifier.send(event, status, frame)
+                
+                # Stop camera if the print is finished/failed
+                if event in ('print_finish', 'print_failure'):
+                    camera_manager.stop()
+
+                task_queue.task_done()
+            except queue.Empty:
+                continue
+
+    def on_connect_callback():
+        log.info("WatchClient connected to printer. Requesting full status dump.")
+        client.dump_info()
+
+    # --- Signal Handler for Graceful Shutdown ---
+    def signal_handler(signum, frame):
+        log.info("Shutdown signal received. Cleaning up...")
+        shutdown_event.set()
+
+    signal.signal(signal.SIGINT, signal_handler)
+    signal.signal(signal.SIGTERM, signal_handler)
 
     try:
-        bambu_client.start_watch_client(custom_callback, on_watch_client_connect)
+        # --- Start Application ---
+        log.info("Starting Bambu Notify...")
+        worker_thread = threading.Thread(target=notification_worker, daemon=True)
+        worker_thread.start()
 
-        activity_thread = threading.Thread(target=main_queue_runner)
-
-        activity_thread.start()
-
-        while True:
-            time.sleep(1)  # Just keep the main thread alive
-
-    except KeyboardInterrupt as err:
-        pass
-
+        client.start_watch_client(printer_status_callback, on_connect_callback)
+        log.info("Application is running. Press Ctrl+C to exit.")
+        shutdown_event.wait() # Keep main thread alive until shutdown signal
+    
     finally:
-        print("Notice: Streaming stopped.")
+        log.info("Shutting down...")
+        if worker_thread.is_alive():
+            worker_thread.join(timeout=2)
 
-        TASK_QUEUE.put(None)
-
-        if activity_thread:
-            activity_thread.join()
-
-        if CAMERA_ACTIVE:
-            bambu_client.stop_camera_stream()
-
-        bambu_client.stop_watch_client()
-
+        camera_manager.stop()
+        print_logger.stop_logging()
+        client.stop_watch_client()
+        log.info("Cleanup complete. Exiting.")
 
 if __name__ == '__main__':
     main()

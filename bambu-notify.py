@@ -89,7 +89,7 @@ class StateManager:
         self.is_primed = True
         log.info("State has been primed.")
 
-    def process_status(self, status: PrinterStatus) -> Union(str, None):
+    def process_status(self, status: PrinterStatus) -> Union[str, None]:
         """Processes a new status update and returns an event name if a notification is needed."""
         if not self.is_primed:
             self.prime_state(status)

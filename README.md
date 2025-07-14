@@ -3,7 +3,7 @@
 A powerful, customizable notification and logging tool for your Bambu Lab 3D printer. Get real-time updates with camera snapshots on Discord, and dive deep into your printer's activity with an advanced log analyzer.
 
 
----
+![Example Notification](https://github.com/kloptops/bambu-notify/resources/screenshot.png)
 
 ## ✨ Features
 

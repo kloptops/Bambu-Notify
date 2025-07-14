@@ -1,1 +1,7 @@
-bambu-connect
+# Standard libraries from PyPI
+pyyaml
+jinja2
+requests
+
+# Custom dependency from a GitHub fork
+git+https://github.com/kloptops/bambu-connect.git

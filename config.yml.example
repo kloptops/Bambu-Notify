@@ -34,13 +34,30 @@ notifications:
   # The Jinja2 template file to use for formatting messages.
   template_file: "messages.jinja"
 
-  # --- Event Triggers (true/false) ---
-  report_start: true               # Notify when a print starts.
+
+  # --- Event Triggers ---
+
+  # Defines which event triggers the "Print Start" notification.
+  # 'process_start': (Earliest) The moment the printer's gcode_state changes to RUNNING.
+  #                  Camera may not be available yet.
+  # 'print_begin': The moment the printer begins its pre-print calibration routine
+  #                (heating, leveling, etc.). Camera is likely unavailable.
+  # 'extrusion_start': (Default, Recommended) The moment the first layer begins extruding.
+  #                    This is the most reliable time to get a useful camera snapshot.
+  report_start_event: "print_begin"
+
+  # Defines which event triggers the "Print Finish" notification.
+  # 'print_end': (Recommended) The moment the print head finishes its last move and heaters
+  #              are commanded off. This is the best time for a final photo before
+  #              the print bed lowers.
+  # 'process_end': (Default) The moment the printer's gcode_state changes to FINISH.
+  report_finish_event: "print_end"
+
   report_finish: true              # Notify when a print finishes successfully.
   report_failure: true             # Notify when a print fails.
   report_pause: true               # Notify when a print is paused.
-  report_resume: true              # Notify when a print is resumed.
-  
+  report_resume: true              # Notify when a print is resumed.  
+
   report_first_layer: true         # Send a progress report after the first layer.
   report_second_layer: false       # Send a progress report after the second layer.
 

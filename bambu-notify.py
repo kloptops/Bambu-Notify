@@ -41,7 +41,7 @@ def format_time(minutes: int) -> str:
         parts.append(f"{hours} hour{'s' if hours > 1 else ''}")
     if mins > 0:
         parts.append(f"{mins} minute{'s' if mins > 1 else ''}")
-    
+
     if len(parts) == 0:
         return ""
 
@@ -50,15 +50,13 @@ def format_time(minutes: int) -> str:
 
     return ", ".join(parts[:-1]) + f" and {parts[-1]}"
 
-
 class StateManager:
     """Encapsulates all logic for managing printer state and deciding when to notify."""
 
     def __init__(self, config):
         self.config = config.get('notifications', {})
         self.is_primed = False
-        # The gcode_state is now initialized here and NOT in the reset method.
-        self.last_gcode_state = "IDLE" 
+        self.last_gcode_state = "IDLE"
         self._reset_print_state()
 
     def _reset_print_state(self):
@@ -68,6 +66,12 @@ class StateManager:
         self.reported_percentages = set()
         self.reported_first_layer = False
         self.reported_second_layer = False
+        self.reported_process_start = False
+        self.reported_print_begin = False
+        self.reported_extrusion_start = False
+        self.reported_print_end = False
+        self.initial_bed_target_temp = 0
+        self.initial_nozzle_target_temp = 0
 
     def prime_state(self, status: PrinterStatus):
         """Sets the initial state from the first status message to prevent old notifications."""
@@ -77,8 +81,16 @@ class StateManager:
 
         if status.gcode_state == 'RUNNING':
             log.debug(f"Printer is running. Priming progress: {status.mc_percent}% complete, layer {status.layer_num}.")
+            # If we start mid-print, mark all start events as "reported" to prevent false triggers
+            self.reported_process_start = True
+            self.reported_print_begin = True
+
+            if status.layer_num > 0:
+                self.reported_extrusion_start = True
+
             if status.layer_num > 1:
                 self.reported_first_layer = True
+
             if status.layer_num > 2:
                 self.reported_second_layer = True
 
@@ -93,35 +105,80 @@ class StateManager:
         """Processes a new status update and returns an event name if a notification is needed."""
         if not self.is_primed:
             self.prime_state(status)
-            return None # Don't notify on the first priming message
+            return None
 
         event = None
-        # --- Check for major state changes ---
+        start_event_type = self.config.get('report_start_event', 'extrusion_start')
+        finish_event_type = self.config.get('report_finish_event', 'print_end')
+
+        # --- Track Initial Temperatures at the start of the print ---
+        if self.reported_process_start and self.initial_bed_target_temp == 0 and status.bed_target_temper > 0:
+            log.debug(f"Captured initial target temps. Bed: {status.bed_target_temper}, Nozzle: {status.nozzle_target_temper}")
+            self.initial_bed_target_temp = status.bed_target_temper
+            self.initial_nozzle_target_temp = status.nozzle_target_temper
+
+        # --- GCODE STATE CHANGE DETECTION (Finish, Pause, Resume, etc.) ---
         if status.gcode_state != self.last_gcode_state:
             log.info(f"State changed from '{self.last_gcode_state}' to '{status.gcode_state}'")
-            
-            # --- FIX: More specific condition for a new print start ---
+
+            # This is the 'process_start' event. It happens when gcode_state enters RUNNING.
             if status.gcode_state == 'RUNNING' and self.last_gcode_state != 'PAUSE':
-                self._reset_print_state()
-                if self.config.get('report_start', True): event = 'print_start'
+                # This whole block should only ever run ONCE per print job.
+                # Use reported_process_start as a guard to prevent re-entry.
+                if not self.reported_process_start:
+                    self._reset_print_state()
+                    # Set the master "process started" guard flag immediately.
+                    self.reported_process_start = True
+
+                    # Now, check if we should fire the specific 'process_start' event.
+                    if start_event_type == 'process_start':
+                        event = 'start_process'
+
             elif status.gcode_state == 'FINISH':
-                if self.config.get('report_finish', True): event = 'print_finish'
+                if finish_event_type == 'process_end':
+                    event = 'process_end'
             elif status.gcode_state == 'FAILED':
                 if self.config.get('report_failure', True): event = 'print_failure'
             elif status.gcode_state == 'PAUSE':
                 if self.config.get('report_pause', True): event = 'print_pause'
             elif self.last_gcode_state == 'PAUSE' and status.gcode_state == 'RUNNING':
                 if self.config.get('report_resume', True): event = 'print_resume'
-            
+
             # Update the state AFTER processing the change
             self.last_gcode_state = status.gcode_state
             if event: return event
 
-        # --- If not printing, do nothing else ---
-        if status.gcode_state != 'RUNNING':
+        # --- If not in a printing-related state, do nothing else ---
+        if status.gcode_state not in ('RUNNING', 'PREPARE'):
             return None
 
-        # --- Check for progress-based notifications ---
+        # --- GRANULAR START EVENT DETECTION (during RUNNING state) ---
+
+        # 'print_begin': Triggered when the printer enters the "Auto bed leveling" sub-stage (1).
+        # This is a reliable indicator that the pre-print calibration has started.
+        if start_event_type == 'print_begin' and not self.reported_print_begin and status.mc_print_sub_stage == 1:
+            self.reported_print_begin = True
+            return 'start_print_begin'
+
+        # 'extrusion_start': Triggered when layer_num becomes > 0.
+        # This signifies the start of actual printing.
+        if start_event_type == 'extrusion_start' and not self.reported_extrusion_start and status.layer_num > 0:
+            self.reported_extrusion_start = True
+            return 'start_extrusion'
+
+        # 'print_end' event: Triggered when heaters are commanded off.
+        if finish_event_type == 'print_end' and not self.reported_print_end:
+            # We must be near the end of the print (e.g., > 95%) to avoid false triggers.
+            # And the initial temps must have been captured.
+            if status.mc_percent >= 95 and self.initial_bed_target_temp > 0:
+                bed_turned_off = self.initial_bed_target_temp > 0 and status.bed_target_temper == 0
+                nozzle_turned_off = self.initial_nozzle_target_temp > 0 and status.nozzle_target_temper == 0
+
+                # Trigger if bed heater turns off, OR if nozzle heater turns off (for prints with no bed heat).
+                if bed_turned_off or (self.initial_bed_target_temp == 0 and nozzle_turned_off):
+                    self.reported_print_end = True
+                    return 'print_end'
+
         if self.config.get('report_first_layer') and not self.reported_first_layer and status.layer_num > 1:
             self.reported_first_layer = True
             return 'progress_report'
@@ -137,9 +194,8 @@ class StateManager:
                 for i in range(p + 1):
                     self.reported_percentages.add(i)
                 return 'progress_report'
-        
-        return None
 
+        return None
 
 class CameraManager:
     """Manages the camera stream and frame capture."""
@@ -189,17 +245,16 @@ class CameraManager:
         log.warning("Could not retrieve a camera frame in time.")
         return b""
 
-
 class Notifier:
     """Renders templates and sends notifications to webhooks."""
     def __init__(self, config):
         # First, get the 'notifications' section of the config.
         notifications_config = config.get('notifications', {})
-        
+
         # Now, get the specific settings from within that section.
         self.webhooks = notifications_config.get('webhooks', [])
         template_path = Path(notifications_config.get('template_file', 'messages.jinja'))
-        
+
         if not template_path.exists():
             log.error(f"Template file not found at: {template_path}")
             sys.exit(1)
@@ -213,7 +268,7 @@ class Notifier:
 
     def send(self, event: str, status: PrinterStatus, frame: bytes):
         log.info(f"Sending notification for event: '{event}'")
-        
+
         # If there are no webhooks configured, don't even bother rendering.
         if not self.webhooks:
             log.warning("No webhooks configured. Skipping notification.")
@@ -235,7 +290,7 @@ class Notifier:
         for i, url in enumerate(self.webhooks):
             try:
                 files = {'camera.jpg': (f"camera_{event}.jpg", frame, 'image/jpeg')} if frame else None
-                
+
                 if files:
                     payload = {'payload_json': json.dumps({'content': content})}
                     response = requests.post(url, files=files, data=payload, timeout=10)
@@ -259,13 +314,14 @@ class PrintLogger:
 
     def __init__(self, config):
         self.config = config.get('print_log', {})
+        self.is_logging = False
+
         if not self.config.get('enabled', False):
             return
 
         self.log_dir = Path(self.config.get('log_directory', 'print_logs'))
         self.log_interval = self.config.get('log_interval_seconds', 15)
-        
-        self.is_logging = False
+
         self.log_file = None
         self.last_log_time = 0
 
@@ -300,10 +356,10 @@ class PrintLogger:
         """Opens a new log file at the start of a print."""
         if self.is_logging:
             return
-            
+
         filename = self._generate_filename(status)
         filepath = self.log_dir / filename
-        
+
         try:
             self.log_file = open(filepath, 'w')
             self.is_logging = True
@@ -354,7 +410,6 @@ class PrintLogger:
         log_entry = json.dumps(filtered_data)
         self.log_file.write(log_entry + "\n")
 
-
 def main():
     parser = argparse.ArgumentParser(description="Bambu Lab printer monitoring and notification tool.")
     parser.add_argument("-c", "--config", default="config.yml", help="Path to the configuration file.")
@@ -386,7 +441,7 @@ def main():
     # --- Define Callbacks and Workers ---
     def printer_status_callback(status: PrinterStatus):
         percentage_mode = config.get('notifications', {}).get('percentage_mode', 'time')
-        
+
         if percentage_mode == 'layer':
             # Defend against division by zero if total_layer_num is not yet known (e.g., at print start)
             if status.total_layer_num > 0:
@@ -413,13 +468,13 @@ def main():
         while not shutdown_event.is_set():
             try:
                 event, status = task_queue.get(timeout=1)
-                
+
                 frame = b""
                 if config.get('camera', {}).get('enabled', True):
                     frame = camera_manager.get_frame()
-                
+
                 notifier.send(event, status, frame)
-                
+
                 # Stop camera if the print is finished/failed
                 if event in ('print_finish', 'print_failure'):
                     camera_manager.stop()
@@ -449,15 +504,15 @@ def main():
         client.start_watch_client(printer_status_callback, on_connect_callback)
         log.info("Application is running. Press Ctrl+C to exit.")
         shutdown_event.wait() # Keep main thread alive until shutdown signal
-    
+
     finally:
         log.info("Shutting down...")
         if worker_thread.is_alive():
             worker_thread.join(timeout=2)
 
         camera_manager.stop()
-        print_logger.stop_logging()
         client.stop_watch_client()
+        print_logger.stop_logging()
         log.info("Cleanup complete. Exiting.")
 
 if __name__ == '__main__':

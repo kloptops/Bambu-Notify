@@ -10,15 +10,34 @@
   - format_time(minutes): Formats an integer of minutes into a human-readable string.
 #}
 
-{% block print_start %}
+{% block start_process %}
+⏳ **Print Started: {{ print.subtask_name or 'Unknown File' }}**
+The printer is preparing to print.
+{% endblock %}
+
+
+{% block start_print_begin %}
+⏳ **Print Started: {{ print.subtask_name or 'Unknown File' }}**
+The printer is preparing to print.
+{% endblock %}
+
+
+{% block start_extrusion %}
 ✅ **Print Started: {{ print.subtask_name or 'Unknown File' }}**
+The first layer is now being printed!
 Estimated Time: {{ format_time(print.mc_remaining_time) }}
 {% endblock %}
 
 
-{% block print_finish %}
-🎉 **Print Finished: {{ print.subtask_name or 'Unknown File' }}**
-The print completed successfully!
+{% block print_end %}
+🎉 **Process Finished: {{ print.subtask_name or 'Unknown File' }}**
+The print job is fully complete.
+{% endblock %}
+
+
+{% block process_end %}
+🎉 **Process Finished: {{ print.subtask_name or 'Unknown File' }}**
+The print job is fully complete.
 {% endblock %}
 
 

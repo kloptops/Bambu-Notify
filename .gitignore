@@ -162,5 +162,6 @@ cython_debug/
 #.idea/
 
 # Don't allow these to be added.
+.DS_Store
 config.yml
 print_logs/

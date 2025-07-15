@@ -2,13 +2,14 @@
 
 A powerful, customizable notification and logging tool for your Bambu Lab 3D printer. Get real-time updates with camera snapshots on Discord, and dive deep into your printer's activity with an advanced log analyzer.
 
-
 ![Example Notification](https://github.com/kloptops/Bambu-Notify/blob/main/resources/screenshot.png)
 
 ## ✨ Features
 
-- **Event-Driven Notifications:** Get alerts for key events:
-  - Print Start, Finish, Failure, Pause, and Resume.
+- **Granular Event Notifications:** Get alerts for the *exact* moment a print phase begins or ends:
+  - **Start Events:** Choose to be notified at the start of the print *process*, the beginning of *calibration*, or the moment *extrusion* begins (best for camera shots!).
+  - **End Events:** Get a notification the moment the print *physically finishes* (before the bed lowers) or when the entire *process is complete*.
+  - Standard alerts for Failure, Pause, and Resume.
 - **Rich Progress Reporting:**
   - Receive updates at configurable percentage milestones (e.g., 25%, 50%, 75%).
   - Get special notifications after the first and/or second layers complete.
@@ -44,12 +45,28 @@ This script connects to your Bambu Lab printer over your local network via its b
     # On Windows, use: venv\Scripts\activate
     ```
 
-3.  **Install the required packages:**
+3.  **Install Dependencies:**
+
+    Create a file named `requirements.txt` in the project root with the exact content below. This is crucial for installing the correct libraries.
+
+    ```
+    # requirements.txt
+
+    # Standard libraries from PyPI
+    pyyaml
+    jinja2
+    requests
+
+    # Custom dependency from a GitHub fork
+    git+https://github.com/kloptops/bambu-connect.git
+    ```
+
+    > **📌 Important Note:** This project relies on a specific fork of the `bambu-connect` library to support all its features. The line `git+https://...` in the requirements file directs `pip` to install this specific version from GitHub instead of the standard version from PyPI.
+
+    Now, run the installation command from your terminal:
     ```bash
     pip install -r requirements.txt
     ```
-
-    *(You will need to create a `requirements.txt` file containing `requests`, `pyyaml`, `jinja2`, and `bambu-connect`)*
 
 ## 🔧 Configuration
 
@@ -60,61 +77,34 @@ All settings are managed in a single `config.yml` file.
     cp config.yml.example config.yml
     ```
 
-2.  **Edit `config.yml`** with your favorite text editor.
+2.  **Edit `config.yml`** with your printer details, webhook URLs, and desired notification settings.
 
 ### Bambu Printer Details
-You need to provide your printer's IP address, access code, and serial number.
-
 ```yaml
-bambu_printer:
-  hostname: "192.168.1.100"       # IP address of your printer
-  access_code: "12345678"          # Access code from the printer's screen
-  serial: "00M00A000000000"        # Serial number of your printer
+bambu_printer:                     # On the devices LCD.
+  hostname: "192.168.1.100"        # From Settings -> WLAN -> IP Address
+  access_code: "12345678"          # From Settings -> WLAN -> Access Code
+  serial: "00M00A000000000"        # From Settings -> Device -> "Printer"
 ```
--   **`hostname`**: Your printer's IP address. You can find this in your router's device list or on the printer's network settings screen.
--   **`access_code`**: Found on the printer's screen under `Settings -> Network`.
--   **`serial`**: Found on a label on the back of the printer or in the device info screen.
 
 ### Notification Settings
 This section controls what you get notified about and how.
 
 ```yaml
 notifications:
-  # A list of Discord webhook URLs.
   webhooks:
     - "https://discord.com/api/webhooks/your_webhook_id/your_webhook_token"
 
-  # How to calculate print completion percentage.
-  # 'time' (default) or 'layer'
-  percentage_mode: "layer"
+  # --- Event Triggers ---
+  # Defines which event triggers the "Print Start" notification.
+  # 'off', 'process_start', 'print_begin' (default), 'extrusion_start'
+  report_start_event: "print_begin"
 
-  # --- Event Triggers (true/false) ---
-  report_start: true
-  report_finish: true
-  report_failure: true
-  report_pause: true
-  report_resume: true
-  
-  report_first_layer: true
-  report_second_layer: false
+  # Defines which event triggers the "Print Finish" notification.
+  # 'off', 'print_end' (default), 'process_end'
+  report_finish_event: "print_end"
 
-  # Send a progress report when these percentages are reached.
-  report_percentages:
-    - 25
-    - 50
-    - 75
-```
--   **`webhooks`**: A list of one or more Discord webhook URLs. [How to create a Discord Webhook](https://support.discord.com/hc/en-us/articles/228383668-Intro-to-Webhooks).
--   **`percentage_mode`**: Use `'time'` for the printer's estimate or `'layer'` for a more accurate physical progress calculation (`current_layer / total_layers`).
-
-### Print Log Settings
-Enable this to save detailed logs for every print, which can be analyzed with the `log-analyzer.py` tool.
-
-```yaml
-print_log:
-  enabled: true                    # Set to true to enable logging prints.
-  log_directory: "print_logs"      # Directory to save the log files.
-  log_interval_seconds: 15         # How often to write a status update to the log.
+  # ... other triggers ...
 ```
 
 ## ▶️ Running the Script
@@ -135,31 +125,19 @@ Press `Ctrl+C` to stop the script gracefully.
 
 ## 🎨 Customizing Notifications
 
-All notification messages are generated from the `messages.jinja` file. You can edit the text, add emojis, or rearrange information to your liking.
-
-The following variables are available inside the template:
-
--   `event`: The name of the event that triggered the notification (e.g., `'print_start'`).
--   `print`: The full `PrinterStatus` object, giving you access to all data from the printer. Key attributes include:
-    -   `print.subtask_name`: The name of the G-code file.
-    -   `print.mc_percent`: The completion percentage.
-    -   `print.mc_remaining_time`: Estimated time remaining in minutes.
-    -   `print.layer_num` / `print.total_layer_num`: Current and total layer counts.
-    -   `print.stage_name`: A human-readable description of the printer's current activity (e.g., "Auto bed leveling", "Printing", "Paused due to filament runout").
-
-A helper function is also available:
--   `format_time(minutes)`: Formats an integer of minutes into a friendly string (e.g., "1 hour and 25 minutes").
+All notification messages are generated from the `messages.jinja` file. You can edit the text, add emojis, or rearrange information to your liking using the variables documented in the `README.md` and `bambu_defs.py`.
 
 ## ❤️ Contributing
 
 Contributions are welcome! If you have a feature idea, find a bug, or want to improve the documentation, please feel free to open an issue or submit a pull request.
+
+--
 
 ## 🔬 Advanced Tool: Log Analyzer
 
 If you have `print_log` enabled, you can use the `log-analyzer.py` script to inspect the generated log files. This is incredibly useful for debugging or understanding the printer's internal state machine.
 
 ### Standard Diff Mode
-
 Shows a running list of every value that changes between log entries.
 
 ```bash
@@ -171,16 +149,13 @@ python3 log-analyzer.py print_logs/your_log.log --tolerance bed_temper:1.0 --tol
 ```
 
 ### Watch Mode
-
 Pinpoint what happens when a specific value changes. The analyzer will only print output when a "watched" key changes, showing the entries immediately before and after the event.
 
-This is perfect for figuring out what mysterious values like `stg_cur` mean.
-
 ```bash
-# Watch for changes in 'stg_cur' and show 3 log entries of context
-python3 log-analyzer.py print_logs/your_log.log --watch stg_cur --context 3
+# Watch for changes in 'stg_cur' and 'mc_print_sub_stage'
+python3 log-analyzer.py print_logs/your_log.log --watch stg_cur --watch mc_print_sub_stage
 ```
 
 ## 📜 License
 
-This project is licensed under the MIT License. See the `LICENSE` file for details.
+This project is licensed under the [MIT License](LICENSE).
